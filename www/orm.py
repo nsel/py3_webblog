@@ -9,27 +9,32 @@ import aiomysql
 def log(sql, args=()):
     logging.info('SQL: %s' % sql)
 
+# 创建一个全局连接池，每个HTTP请求都从池中获得数据库连接
 async def create_pool(loop, **kw):
     logging.info('create database connection pool...')
     global __pool
     __pool = await aiomysql.create_pool(
-            host = kw.get('host', 'localhost')
-            port = kw.get('port', 3306)
-            user = kw['user']
-            password = kw['password']
-            db = kw['db']
-            charset = kw.get('charset', 'utf8')
-            autocommit = kw.get('autocommit', True)
-            maxsize = kw.get('maxsize', 10)
-            minsize = kw.get('minsize' 1)
-            loop = loop
+            host=kw.get('host', 'localhost'),
+            port=kw.get('port', 3306),
+            user=kw['user'],
+            password=kw['password'],
+            db=kw['db'],
+            charset=kw.get('charset', 'utf8'),
+            autocommit=kw.get('autocommit', True),
+            # 最大连接数
+            maxsize=kw.get('maxsize', 10),
+            minsize=kw.get('minsize', 1),
+            # 接收一个event_loop实例
+            loop=loop
     )
 
+#  封装SQL SELECT语句为select函数
 async def select(sql, args, size=None):
     log(sql, args)
     global __pool
     async with __pool.get() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
+            # SQL语句的占位符是?，MySQL的占位符是%s
             await cur.execute(sql.replace('?', '%s'), args or ())
             if size:
                 rs = await cur.fetchmany(size)
@@ -38,22 +43,25 @@ async def select(sql, args, size=None):
         logging.info('rows returned: %s' % len(rs))
         return rs
 
+# 由于INSERT，UPDATE，DELETE语句的操作参数一样，封装为一个通用函数
+# 返回操作影响到的行数
 async def execute(sql, args, autocommit=True):
     log(sql)
+    global __pool
     async with __pool.get() as conn:
         if not autocommit:
             await conn.begin()
         try:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(sql.replace('?', '%s'), args)
-                affected = cur.rowcount
+                affected_line = cur.rowcount
             if not autocommit:
                 await conn.commit()
         except BaseException as e:
             if not autocommit:
                 await conn.rollback()
             raise
-        return affected
+        return affected_line
 
 def create_args_string(num):
     L = []
@@ -61,7 +69,7 @@ def create_args_string(num):
         L.append('?')
     return ', '.join(L)
 
-
+# 负责保存数据库表的字段名和字段类型
 class Field(object):
     def __init__(self, name, column_type, primary_key, default):
         self.name = name
@@ -72,6 +80,7 @@ class Field(object):
     def __str__(self):
         return '<%s, %s:%s>' % (self.__class__.__name__, self.column_type, self.name)
 
+# 具体字段类型的Field
 class StringField(Field):
     def __init__(self, name=None, primary_key=False, default=None, ddl='varchar(100)'):
         super().__init__(name, ddl, primary_key, default)
@@ -92,15 +101,21 @@ class TextField(Field):
     def __init__(self, name=None, default=None):
         super().__init__(name, 'text', False, default)
 
+# Model的元类，主要工作是为一个数据库表映射为一个封装的类做准备
 class ModelMetaclass(type):
+    # __new__控制__init__的执行，所以在__init__之前执行
+    # cls：当前准备创建的类的对象
+    # name：新创建或修改的类的名字
+    # bases：类继承的基类集合
+    # attrs：类的方法集合
     def __new__(cls, name, bases, attrs):
         if name == 'Model':
             return type.__new__(cls, name, bases, attrs)
         tableName = attrs.get('__table__', None) or name
-        logging.info('found model: %s (table: %s)', % (name, tableName))
+        logging.info('found model: %s (table: %s)' % (name, tableName))
         mappings = dict()
         fields = []
-        primaryKey = None
+        primaryKey = None # 判断主键是否存在
         for k, v in attrs.items():
             if isinstance(v, Field):
                 logging.info('    found mapping: %s ==> %s' % (k, v))
@@ -126,8 +141,9 @@ class ModelMetaclass(type):
         attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (tableName, primaryKey)
         return type.__new__(cls, name, bases, attrs)
 
+
 class Model(dict, metaclass=ModelMetaclass):
-    def __inti__(self, **kw):
+    def __init__(self, **kw):
         super(Model, self).__init__(**kw)
 
     def __getattr__(self, key):
@@ -139,13 +155,13 @@ class Model(dict, metaclass=ModelMetaclass):
     def __setattr__(self, key, value):
         self[key] = value
 
-
     def getValue(self, key):
+        # 内建函数getattr会自动处理
         return getatttr(self, ket, None)
 
     def getValueOrDefault(self, key):
         value = getattr(self, key, None)
-        if value is None:
+        if not value:
             field = self.__mappings__[key]
             if field.default is not None:
                 value = field.default() if callable(field.default) else field.default
@@ -219,4 +235,5 @@ class Model(dict, metaclass=ModelMetaclass):
         rows = await execute(self.__delete__, args)
         if rows != 1:
             logging.warn('failed to remove by primary key: affected rows: %s' % rows)
+
 
